@@ -79,8 +79,8 @@ async def find_watch(address: str | None, seconds: float):
     return None, None
 
 
-async def probe(args) -> dict:
-    out: dict = {"started": datetime.now().isoformat(), "note": args.note, "events": []}
+async def probe(args, out: dict) -> dict:
+    out.update({"started": datetime.now().isoformat(), "note": args.note, "events": []})
     t0 = time.monotonic()
 
     def log(kind, **kw):
@@ -105,14 +105,44 @@ async def probe(args) -> dict:
     client = BleakClient(dev, timeout=30, disconnected_callback=lambda c: (log("disconnected"), disconnected.set()))
     await client.connect()
     log("connected")
-    try:
-        await client.pair()
-        log("paired")
-    except Exception as e:  # already bonded, or pairing not needed
-        log("pair_skipped", error=repr(e))
+    if not args.no_pair:
+        try:
+            await client.pair()
+            log("paired")
+        except Exception as e:  # already bonded, or pairing not needed
+            log("pair_skipped", error=repr(e))
+    await asyncio.sleep(1.0)
+
+    async def ensure_connected():
+        # The watch drops the link now and then (always-connected watches every ~45 s, and often right after pairing).
+        for attempt in range(4):
+            if client.is_connected:
+                try:
+                    _ = client.services.get_characteristic(REQ)
+                    return True
+                except Exception:
+                    pass
+            try:
+                if client.is_connected:
+                    await client.disconnect()
+                print(f"  (re)connecting, attempt {attempt + 1} ...")
+                await client.connect()
+                disconnected.clear()
+                log("reconnected", attempt=attempt + 1)
+                for u in SUBSCRIBE:
+                    try:
+                        await client.start_notify(u, on_notify(u))
+                    except Exception as e:
+                        log("subscribe_failed", uuid=u, error=repr(e))
+                return True
+            except Exception as e:
+                log("reconnect_failed", attempt=attempt + 1, error=repr(e))
+                await asyncio.sleep(3)
+        return False
 
     # GATT table, and every readable characteristic
     gatt = []
+    out["gatt"] = gatt
     for svc in client.services:
         s = {"uuid": svc.uuid, "description": svc.description, "characteristics": []}
         for ch in svc.characteristics:
@@ -137,23 +167,31 @@ async def probe(args) -> dict:
             log("notify", uuid=uuid, hex=hx(b), ascii=ascii_of(b))
         return cb
 
-    present = {ch.uuid for s in client.services for ch in s.characteristics}
-    for u in SUBSCRIBE:
-        if u in present:
-            try:
-                await client.start_notify(u, on_notify(u))
-                log("subscribed", uuid=u)
-            except Exception as e:
-                log("subscribe_failed", uuid=u, error=repr(e))
-    if REQ not in present:
-        out["error"] = "request characteristic 26eb002c not found: not a Casio watch, or a different protocol"
+    # Work from the table recorded above: client.services is gone whenever the link has dropped.
+    props = {c["uuid"]: c["properties"] for s in gatt for c in s["characteristics"]}
+    if REQ not in props:
+        out["error"] = "request characteristic 26eb002c not found in the recorded GATT table (watch dropped during discovery, or a different protocol)"
         return out
-    req_props = next(ch.properties for s in client.services for ch in s.characteristics if ch.uuid == REQ)
-    with_response = "write" in req_props
+    with_response = "write" in props[REQ]
+    if not client.is_connected:
+        log("dropped_after_gatt")
+        if not await ensure_connected():
+            out["error"] = "watch disconnected after reading the GATT table and did not come back"
+            return out
+    else:
+        for u in SUBSCRIBE:
+            if u in props:
+                try:
+                    await client.start_notify(u, on_notify(u))
+                    log("subscribed", uuid=u)
+                except Exception as e:
+                    log("subscribe_failed", uuid=u, error=repr(e))
 
     async def ask(name, code):
-        if disconnected.is_set():
-            return
+        if disconnected.is_set() or not client.is_connected:
+            if not await ensure_connected():
+                log("gave_up", name=name)
+                return
         before = len(answers)
         try:
             await client.write_gatt_char(REQ, bytes([code]), response=with_response)
@@ -190,11 +228,13 @@ def main():
     ap.add_argument("--sweep", action="store_true")
     ap.add_argument("--no-read", action="store_true", help="skip reading GATT characteristics")
     ap.add_argument("--note", default="")
+    ap.add_argument("--no-pair", action="store_true", help="skip pairing (already paired with bluetoothctl)")
     args = ap.parse_args()
+    result: dict = {}
     try:
-        result = asyncio.run(probe(args))
-    except Exception as e:
-        result = {"error": repr(e)}
+        asyncio.run(probe(args, result))
+    except Exception as e:  # keep everything recorded so far
+        result["error"] = repr(e)
         print("Error:", repr(e), file=sys.stderr)
     path = Path(__file__).with_name(f"gshock_probe_{datetime.now():%Y%m%d_%H%M%S}.json")
     path.write_text(json.dumps(result, indent=1))
