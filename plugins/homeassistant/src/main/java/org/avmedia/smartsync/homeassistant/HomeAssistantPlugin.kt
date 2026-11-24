@@ -32,7 +32,7 @@ import org.avmedia.smartsync.plugin.api.WatchPlugin
 class HomeAssistantPlugin : WatchPlugin {
     override val id: String = ID
     // "(mobile app)": next to the MQTT Home Assistant plugin of smartsync-plugins in the same list.
-    override val name: String = "Home Assistant (mobile app)"
+    override val name: String = "Home Assistant"
     override val summary: String = "Your watch as a Home Assistant device."
     override val description: String = "Shows your watch in Home Assistant: battery, steps, heart rate, sleep and workouts as sensors. " +
         "Lets automations send notifications to the watch and change its settings, and use the watch button as a trigger."
